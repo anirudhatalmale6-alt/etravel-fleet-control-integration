@@ -1,0 +1,89 @@
+Proposed patch 1 of 2 - NOT APPLIED.
+
+    file:   /opt/etravel-ai-ops/app/main.py
+    adds:   GET /node/v1/sites
+    why:    Nothing on the controller returns the 126-site inventory. /health
+            gives counts only and /fleet/status returns the four node statuses,
+            so ai1 has no way to answer "list every eShops site" no matter how
+            it authenticates. This adds one read-only route beside the two
+            /node/v1/ routes that already exist, using the same HMAC check, and
+            reads the same /etc/etravel-ai-ops/sites.yml - it does not create a
+            second inventory.
+
+    safety: read-only; no write path; already-existing auth; /node/v1/ is
+            exempt from the browser session middleware by design
+            (app/local_auth.py route_is_public), so no new public surface.
+
+--- a/opt/etravel-ai-ops/app/main.py
++++ b/opt/etravel-ai-ops/app/main.py
+@@ -242,6 +242,45 @@
+         return response
+     except FleetError as exc:
+         raise HTTPException(403, str(exc)) from exc
+
+
++@app.get('/node/v1/sites')
++def node_sites(request: Request):
++    """The authoritative site inventory, read-only.
++
++    AIOPS_NODE_SITES_V1. Added 5 September 2026 because the AI agents had no
++    way to see the fleet: /health publishes counts, /fleet/status publishes the
++    four nodes, and neither publishes the sites themselves. sites.yml remains
++    the single source of truth; this route only reads it.
++
++    Only the fields a caller needs to name a target are returned. Anything that
++    is an instruction for the controller rather than a description of the site -
++    wp_cli, run_user, backup_script, deployment_paths, git_repo, worktree_root -
++    is deliberately left out, so a read of the inventory cannot become a map of
++    how to write to it.
++    """
++    try:
++        caller = verify_incoming_request(
++            settings,
++            audit,
++            request.headers,
++            'GET',
++            '/node/v1/sites',
++            b'',
++        )
++        sites = FleetState(settings).sites()
++    except FleetError as exc:
++        raise HTTPException(403, str(exc)) from exc
++
++    public_fields = (
++        'family',
++        'node',
++        'domain',
++        'base_url',
++        'environment',
++        'production_target',
++    )
++    return {
++        'status': 'ok',
++        'requested_by': caller,
++        'count': len(sites),
++        'sites': [
++            {'target_id': target_id, **{k: value.get(k) for k in public_fields}}
++            for target_id, value in sorted(sites.items())
++        ],
++    }
++
++
+ @app.post('/node/v1/execute')
+ async def node_execute(req: NodeExecuteRequest, request: Request):
+     try:
+         caller = verify_incoming_request(
+
+VERIFY BEFORE APPLYING
+    grep -n "^from\|^import" /opt/etravel-ai-ops/app/main.py | grep -i "FleetState"
+        FleetState must already be imported in main.py. If it is not, add it to
+        the existing `from app.fleet import ...` line rather than a new import.
+
+AFTER APPLYING
+    /opt/etravel-ai-ops/venv/bin/python -m py_compile /opt/etravel-ai-ops/app/main.py
+    systemctl restart etravel-ai-ops.service
+    curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/node/v1/sites
+        expect 403 unsigned - that is the correct answer to an anonymous caller
+
+ROLLBACK
+    restore the .bak file taken before the edit and restart the service.

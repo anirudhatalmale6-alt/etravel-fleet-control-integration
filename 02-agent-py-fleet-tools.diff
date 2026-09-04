@@ -1,0 +1,259 @@
+Proposed patch 2 of 2 - NOT APPLIED.
+
+    file:   /opt/etravel-ai-next/agent.py
+    base:   the file as installed on 5 September 2026, i.e. AFTER the
+            EAI_CHAT_WALL_CLOCK_BUDGET_V1 change. Take a fresh diff if
+            agent.py has moved on since.
+    adds:   EAI_FLEET_TOOLS_V1        - fleet_list_sites, fleet_status,
+                                        fleet_request_production_action and
+                                        navigator_search, registered only when
+                                        the adapter and its secrets are present
+            EAI_FLEET_SINGLE_SITE_GUARD_V1 - any question that names more than
+                                        one site, family or server now enters
+                                        the tool loop instead of being answered
+                                        from the single-site health snapshot
+    needs:  patch 01, ai1_fleet_tools.py and /etc/etravel-ai-next/fleet.env
+            in place first - see README.md for the order.
+
+    apply:  cd / && patch -p1 < 02-agent-py-fleet-tools.diff
+    check:  /opt/etravel-ai-next/.venv/bin/python -m py_compile /opt/etravel-ai-next/agent.py
+
+--- a/opt/etravel-ai-next/agent.py
++++ b/opt/etravel-ai-next/agent.py
+@@ -1618,7 +1618,186 @@
+ ]
+ 
+ 
++# EAI_FLEET_TOOLS_V1
++#
++# The three fleet tools are appended only when the adapter imports cleanly and
++# its secrets are actually configured. A tool the model can see but cannot use
++# is worse than no tool: it answers "I checked and found nothing" instead of
++# "I cannot see the fleet from here".
++#
++# fleet_request_production_action is deliberately NOT called
++# request_production_action. That name is already taken, four entries above, by
++# the tool that creates the Navigator approvals. Two tools cannot share a name.
++try:
++    import ai1_fleet_tools as _fleet
++except Exception:  # noqa: BLE001 - the agent must still start without it
++    _fleet = None
++
++FLEET_TOOLS_READY = bool(
++    _fleet
++    and len(os.environ.get("ETR_FLEET_NODE_SECRET", "").strip()) >= 32
++)
++
++if FLEET_TOOLS_READY:
++    EAI_TOOLS.extend([
++        {
++            "type": "function",
++            "name": "fleet_list_sites",
++            "description": (
++                "The authoritative list of the managed WordPress and non-WordPress "
++                "sites, read live from the AI Ops controller's own inventory "
++                "(/etc/etravel-ai-ops/sites.yml, 126 targets). Use this for every "
++                "question about which sites exist, how many there are, or which "
++                "belong to a family. Every site answer must quote target_id, "
++                "domain, family and node. If this tool reports an error, say that "
++                "the inventory is unavailable - never answer zero."
++            ),
++            "parameters": {
++                "type": "object",
++                "properties": {
++                    "family": {
++                        "type": "string",
++                        "description": "etravel, eshops, collector, fotovoltaika_hub, solar_panels_hub or unassigned. Omit for all.",
++                    },
++                    "node": {
++                        "type": "string",
++                        "description": "primary, failover, collector or collector-new. Omit for all.",
++                    },
++                    "environment": {
++                        "type": "string",
++                        "description": "production or staging. Omit for all.",
++                    },
++                },
++                "required": [],
++                "additionalProperties": False,
++            },
++        },
++        {
++            "type": "function",
++            "name": "fleet_status",
++            "description": (
++                "Live status of the AI Ops controller node: role, site count, "
++                "family counts and rollout gates. Read-only."
++            ),
++            "parameters": {
++                "type": "object",
++                "properties": {},
++                "required": [],
++                "additionalProperties": False,
++            },
++        },
++        {
++            "type": "function",
++            "name": "fleet_request_production_action",
++            "description": (
++                "Record a proposed production action against one inventory target. "
++                "This tool NEVER executes anything and NEVER creates an approval "
++                "in the controller - it returns the proposal to you. Say so "
++                "plainly; do not tell the owner an approval is waiting."
++            ),
++            "parameters": {
++                "type": "object",
++                "properties": {
++                    "target_id": {
++                        "type": "string",
++                        "description": "Exact target_id from fleet_list_sites.",
++                    },
++                    "action": {
++                        "type": "string",
++                        "enum": [
++                            "flush_rewrite_rules",
++                            "delete_expired_transients",
++                            "spawn_due_cron",
++                            "activate_plugin",
++                            "deactivate_plugin",
++                            "update_allowlisted_option",
++                            "cloudflare_purge_urls",
++                            "cloudflare_purge_zone",
++                        ],
++                    },
++                    "parameters_json": {
++                        "type": "string",
++                        "description": "JSON object encoded as a string.",
++                    },
++                    "reason": {"type": "string"},
++                },
++                "required": ["target_id", "action", "parameters_json", "reason"],
++                "additionalProperties": False,
++            },
++        },
++    ])
++
++    if len(os.environ.get("ETR_NAVIGATOR_HMAC_SECRET", "").strip()) >= 32:
++        EAI_TOOLS.append({
++            "type": "function",
++            "name": "navigator_search",
++            "description": (
++                "Search the eTravel Operations Navigator index on etravel.gr for "
++                "campaigns, contacts, excursions, translations, reservations, B2B, "
++                "referrals, conversions, delistings and complaints. Read-only. "
++                "Results carry site_id, site_family and server_id - quote them."
++            ),
++            "parameters": {
++                "type": "object",
++                "properties": {
++                    "query": {"type": "string"},
++                    "limit": {"type": "integer", "minimum": 1, "maximum": 50},
++                },
++                "required": ["query"],
++                "additionalProperties": False,
++            },
++        })
++
++
++def _tool_fleet_list_sites(
++    family: str,
++    node: str,
++    environment: str,
++) -> dict[str, Any]:
++    sites = _fleet.fleet_list_sites(
++        family=family or None,
++        node=node or None,
++        environment=environment or None,
++    )
++    return {
++        "status": "ok",
++        "source": "etravel-ai-ops controller, /etc/etravel-ai-ops/sites.yml",
++        "filters": {"family": family, "node": node, "environment": environment},
++        "count": len(sites),
++        "sites": sites,
++    }
++
++
+ def _run_orchestration_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
++    # EAI_FLEET_TOOLS_V1
++    if name == "fleet_list_sites":
++        return _tool_fleet_list_sites(
++            str(args.get("family", "")),
++            str(args.get("node", "")),
++            str(args.get("environment", "")),
++        )
++    if name == "fleet_status":
++        return {"status": "ok", "node": _fleet.fleet_status()}
++    if name == "navigator_search":
++        return {
++            "status": "ok",
++            "result": _fleet.navigator_search(
++                str(args.get("query", "")),
++                int(args.get("limit", 20)),
++            ),
++        }
++    if name == "fleet_request_production_action":
++        try:
++            parameters = json.loads(str(args.get("parameters_json", "{}")))
++        except Exception as exc:  # noqa: BLE001
++            raise ValueError(f"parameters_json is not valid JSON: {exc}") from exc
++        return _fleet.fleet_request_production_action(
++            str(args.get("target_id", "")),
++            str(args.get("action", "")),
++            parameters if isinstance(parameters, dict) else {},
++            str(args.get("reason", "")),
++        )
++
+     if name == "runtime_info":
+         return _tool_runtime_info()
+     if name == "live_browser_check":
+@@ -2110,6 +2289,36 @@
+             "approval_list",
+             "approval_detail",
+             "request_production_action",
++            "fleet_list_sites",
++            "fleet_status",
++            "navigator_search",
++        )
++    )
++
++    # EAI_FLEET_SINGLE_SITE_GUARD_V1
++    #
++    # The fast path below answers from _tool_extended_health(), which is pinned
++    # to one WordPress install: read_only_bridge.py line 6,
++    # WP_ROOT = /var/www/vhosts/etravel.gr/httpdocs.
++    #
++    # On 4 September 2026 "Check all eShops sites for PHP version and WordPress
++    # version" was answered by this shortcut with etravel.gr's PHP 8.4.25 and
++    # WordPress 7.0.4 - a confident, well-formatted, entirely accurate report
++    # about the wrong subject. The model never entered the tool loop, so it had
++    # no way to notice it had been handed a different site than the one asked
++    # about.
++    #
++    # A malformed reply gets reported as a bug in a day. A well-formed reply
++    # about the wrong subject is believed. So any question that names more than
++    # one site, another family, another server, or asks for a comparison, must
++    # go to the tool loop where it can actually look.
++    multi_site_request = any(
++        phrase in normalized_request
++        for phrase in (
++            "all ", "every ", "each ", "which sites", "list sites",
++            "eshops", "e-shops", "sister", "family", "families",
++            "fleet", "inventory", "126", "compare", "versus", " vs ",
++            "failover", "collector", "staging", "across",
+         )
+     )
+ 
+@@ -2131,7 +2340,11 @@
+         )
+     )
+ 
+-    if production_status_request and not explicit_orchestration_request:
++    if (
++        production_status_request
++        and not explicit_orchestration_request
++        and not multi_site_request
++    ):
+         evidence = _tool_extended_health()
+ 
+         if not OPENAI_KEY_FILE.is_file():
